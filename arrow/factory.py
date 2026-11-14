@@ -244,7 +244,7 @@ class ArrowFactory:
 
             # (str) -> parse @ tzinfo
             elif isinstance(arg, str):
-                dt = parser.DateTimeParser(locale).parse_iso(arg, normalize_whitespace)
+                dt = parser.get_parser(locale).parse_iso(arg, normalize_whitespace)
                 return self.type.fromdatetime(dt, tzinfo=tz)
 
             # (struct_time) -> from struct_time
@@ -282,7 +282,7 @@ class ArrowFactory:
 
             # (str, format) -> parse @ tzinfo
             elif isinstance(arg_1, str) and isinstance(arg_2, (str, list)):
-                dt = parser.DateTimeParser(locale).parse(
+                dt = parser.get_parser(locale).parse(
                     args[0], args[1], normalize_whitespace
                 )
                 return self.type.fromdatetime(dt, tzinfo=tz)

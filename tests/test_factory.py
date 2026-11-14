@@ -10,8 +10,8 @@ try:
 except ImportError:
     from backports.zoneinfo import ZoneInfo
 
-from arrow import Arrow
-from arrow.parser import ParserError
+from arrow import Arrow, parser
+from arrow.parser import DateTimeParser, ParserError
 
 from .utils import assert_datetime_equality
 
@@ -393,3 +393,79 @@ class TestNow:
 
     def test_tz_str(self):
         assert_datetime_equality(self.factory.now("EST"), datetime.now(ZoneInfo("EST")))
+
+
+@pytest.mark.usefixtures("arrow_factory")
+class TestGetParserCache:
+    """The factory main entry must reuse cached parser instances instead of
+    rebuilding a DateTimeParser (and its regexes) on every call."""
+
+    CASES = [
+        ("2013-05-05 12:30:45", "YYYY-MM-DD HH:mm:ss"),
+        ("2013-05-05T12:30:45.123456+05:30", "YYYY-MM-DDTHH:mm:ss.SSSSSSZZ"),
+        ("May 5 2013 2:30 PM", "MMMM D YYYY h:mm A"),
+        ("2013-05-05 12:30:45 America/Chicago", "YYYY-MM-DD HH:mm:ss ZZZ"),
+    ]
+
+    def test_get_reuses_cached_parser_instances(self):
+        parser.get_parser.cache_clear()
+
+        self.factory.get("2013-05-05 12:30:45", "YYYY-MM-DD HH:mm:ss")
+        info = parser.get_parser.cache_info()
+        assert info.misses == 1
+        assert info.currsize == 1
+
+        # same locale again: both the (str, fmt) path and the ISO path hit the cache
+        self.factory.get("2014-06-06 01:02:03", "YYYY-MM-DD HH:mm:ss")
+        self.factory.get("2014-06-06T01:02:03")
+        # equivalent locale spellings share the same cached instance
+        self.factory.get("2014-06-06", locale="en-US")
+        info = parser.get_parser.cache_info()
+        assert info.misses == 1
+        assert info.hits == 3
+        assert info.currsize == 1
+
+        # a different locale adds exactly one new cached instance
+        self.factory.get("5 mai 2013", "D MMMM YYYY", locale="fr")
+        info = parser.get_parser.cache_info()
+        assert info.misses == 2
+        assert info.currsize == 2
+
+    def test_get_results_consistent_with_fresh_parser(self):
+        for string, fmt in self.CASES:
+            expected = Arrow.fromdatetime(
+                DateTimeParser(cache_size=0).parse(string, fmt)
+            )
+            assert self.factory.get(string, fmt) == expected
+
+        iso_string = "2013-05-05T12:30:45.123456"
+        expected = Arrow.fromdatetime(DateTimeParser(cache_size=0).parse_iso(iso_string))
+        assert self.factory.get(iso_string) == expected
+
+    def test_get_concurrent_consistency(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        parser.get_parser.cache_clear()
+
+        inputs = [
+            (("2013-05-05 12:30:45", "YYYY-MM-DD HH:mm:ss"), {}),
+            (("5 mai 2013", "D MMMM YYYY"), {"locale": "fr"}),
+            (("2014-06-06T01:02:03",), {}),
+            (("2014-06-06 01:02:03.123456",), {"locale": "en-US"}),
+        ]
+        expected = [self.factory.get(*args, **kwargs) for args, kwargs in inputs]
+
+        def work(i):
+            args, kwargs = inputs[i % len(inputs)]
+            return self.factory.get(*args, **kwargs)
+
+        total = 2000
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(work, range(total)))
+
+        assert results == [expected[i % len(inputs)] for i in range(total)]
+
+        # only two distinct locales were used, so only two parser instances
+        info = parser.get_parser.cache_info()
+        assert info.currsize == 2
+        assert info.misses == 2

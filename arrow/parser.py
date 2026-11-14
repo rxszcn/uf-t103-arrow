@@ -32,6 +32,18 @@ from arrow import locales
 from arrow.constants import DEFAULT_LOCALE
 from arrow.util import next_weekday, normalize_timestamp
 
+#: Default size of the per-parser LRU cache for regular expressions generated
+#: from format strings. Format-string diversity within one process is typically
+#: small (ingestion pipelines reuse a handful of formats), so 256 entries is
+#: ample while keeping memory bounded. Pass ``cache_size=0`` to
+#: :class:`DateTimeParser` to disable this cache explicitly.
+DEFAULT_PARSER_CACHE_SIZE = 256
+
+#: Maximum number of shared :class:`DateTimeParser` instances kept by
+#: :func:`get_parser` (one instance per distinct locale). Locale diversity is
+#: naturally bounded, so a small LRU is sufficient.
+_PARSER_CACHE_SIZE = 64
+
 
 class ParserError(ValueError):
     """
@@ -146,7 +158,8 @@ class DateTimeParser:
     produce a datetime that is used by :class:`Arrow <arrow.arrow.Arrow>` internally.
 
     :param locale: the locale string
-    :param cache_size: the size of the LRU cache used for regular expressions. Defaults to 0.
+    :param cache_size: the size of the LRU cache used for regular expressions.
+        Defaults to ``DEFAULT_PARSER_CACHE_SIZE``. Pass 0 to disable caching.
 
     """
 
@@ -206,14 +219,17 @@ class DateTimeParser:
     locale: locales.Locale
     _input_re_map: Dict[_FORMAT_TYPE, Pattern[str]]
 
-    def __init__(self, locale: str = DEFAULT_LOCALE, cache_size: int = 0) -> None:
+    def __init__(
+        self, locale: str = DEFAULT_LOCALE, cache_size: int = DEFAULT_PARSER_CACHE_SIZE
+    ) -> None:
         """
         Contains the regular expressions and functions to parse and split the input strings into tokens and eventually
         produce a datetime that is used by :class:`Arrow <arrow.arrow.Arrow>` internally.
 
         :param locale: the locale string
         :type locale: str
-        :param cache_size: the size of the LRU cache used for regular expressions. Defaults to 0.
+        :param cache_size: the size of the LRU cache used for regular expressions.
+            Defaults to ``DEFAULT_PARSER_CACHE_SIZE``. Pass 0 to disable caching.
         :type cache_size: int
         """
         self.locale = locales.get_locale(locale)
@@ -880,6 +896,40 @@ class DateTimeParser:
         :rtype: re.Pattern[str]
         """
         return re.compile(r"({})".format("|".join(choices)), flags=flags)
+
+
+@lru_cache(maxsize=_PARSER_CACHE_SIZE)
+def _cached_parser(normalized_locale: str) -> DateTimeParser:
+    # Builds (or reuses) the shared parser for an already-normalized locale
+    # name. functools.lru_cache is thread-safe, and exceptions raised for
+    # unsupported locales are not cached, so invalid input keeps raising.
+    return DateTimeParser(locale=normalized_locale)
+
+
+def get_parser(locale: str = DEFAULT_LOCALE) -> DateTimeParser:
+    """
+    Returns a shared, cached :class:`DateTimeParser <arrow.parser.DateTimeParser>` instance for the given locale.
+
+    Building a parser is expensive (it compiles a set of locale-dependent regular expressions), so instances are
+    reused across calls. Locale names are normalized before lookup, meaning that equivalent spellings such as
+    ``'en_us'`` and ``'en-US'`` share a single cached instance. At most ``_PARSER_CACHE_SIZE`` instances are kept,
+    with the least recently used locale evicted first.
+
+    The returned instance is safe to use concurrently from multiple threads: parsing only reads shared state and
+    the underlying regular expression cache (:func:`functools.lru_cache`) is thread-safe.
+
+    :param locale: the locale string
+    :type locale: str
+    :returns: The shared parser instance for the locale.
+    :rtype: DateTimeParser
+    """
+    return _cached_parser(locale.lower().replace("_", "-"))
+
+
+# Expose the underlying cache controls on the public entry point so callers
+# and tests can inspect or reset the shared parser cache.
+get_parser.cache_info = _cached_parser.cache_info  # type: ignore[attr-defined]
+get_parser.cache_clear = _cached_parser.cache_clear  # type: ignore[attr-defined]
 
 
 class TzinfoParser:

@@ -1605,3 +1605,159 @@ class TestFuzzInput:
 
         with pytest.raises(parser.ParserMatchError):
             self.parser.parse(payload, fmt_str)
+
+
+class TestDateTimeParserCacheReuse:
+    """Covers the two-level caching of the parsing path: shared parser
+    instances per locale (level 1) and cached generated regular expressions
+    per format string (level 2)."""
+
+    CASES = [
+        ("2013-05-05 12:30:45", "YYYY-MM-DD HH:mm:ss"),
+        ("2013-05-05T12:30:45.123456+05:30", "YYYY-MM-DDTHH:mm:ss.SSSSSSZZ"),
+        ("May 5 2013 2:30 PM", "MMMM D YYYY h:mm A"),
+        ("5th of May, 2013", "Do [of] MMMM, YYYY"),
+        ("2013-W18-7", "W"),
+        ("1367992474.293378", "X"),
+        ("1367992474293378", "x"),
+        ("2013-05-05 12:30:45 America/Chicago", "YYYY-MM-DD HH:mm:ss ZZZ"),
+        ("2013-05-05", "YYYY-MM-DD"),
+    ]
+
+    ISO_STRINGS = [
+        "2013-05-05",
+        "20130505",
+        "2013-05-05T12:30:45",
+        "2013-05-05 12:30:45.123456",
+        "2016-04-13T13:36:56.456289Z",
+        "2013-05-05T12:30:45+04:30",
+    ]
+
+    def test_get_parser_returns_shared_instance_per_locale(self):
+        parser.get_parser.cache_clear()
+
+        first = parser.get_parser("en_us")
+        # equivalent spellings are normalized to the same cache key
+        assert parser.get_parser("en-us") is first
+        assert parser.get_parser("en_US") is first
+        assert isinstance(first, DateTimeParser)
+
+        # a different locale gets its own instance
+        assert parser.get_parser("fr") is not first
+
+    def test_get_parser_cache_is_bounded_lru(self):
+        info = parser.get_parser.cache_info()
+        assert info.maxsize == 64
+
+    def test_get_parser_invalid_locale_not_cached(self):
+        parser.get_parser.cache_clear()
+
+        with pytest.raises(ValueError):
+            parser.get_parser("not-a-locale")
+        # failures are not cached: the same invalid locale keeps raising
+        with pytest.raises(ValueError):
+            parser.get_parser("not-a-locale")
+        assert parser.get_parser.cache_info().currsize == 0
+
+    def test_shared_parser_has_regex_cache_enabled(self):
+        shared = parser.get_parser("en-us")
+        # lru_cache-wrapped functions expose cache_info
+        assert hasattr(shared._generate_pattern_re, "cache_info")
+
+    def test_default_cache_size_enables_regex_caching(self, mocker):
+        mocked_parser = mocker.patch("arrow.parser.DateTimeParser._generate_pattern_re")
+        default_parser = parser.DateTimeParser()
+
+        for _ in range(100):
+            default_parser._generate_pattern_re(fmt="fmt_a")
+        assert mocked_parser.call_count == 1
+
+    def test_cached_and_uncached_parse_results_identical(self):
+        cached = parser.DateTimeParser()  # regex cache on by default
+        uncached = parser.DateTimeParser(cache_size=0)
+
+        for string, fmt in self.CASES:
+            # repeat to exercise cache hits on the cached parser
+            for _ in range(3):
+                cached_result = cached.parse(string, fmt)
+                uncached_result = uncached.parse(string, fmt)
+                assert cached_result == uncached_result
+                assert str(cached_result) == str(uncached_result)
+
+        for string in self.ISO_STRINGS:
+            for _ in range(3):
+                cached_result = cached.parse_iso(string)
+                uncached_result = uncached.parse_iso(string)
+                assert cached_result == uncached_result
+                assert str(cached_result) == str(uncached_result)
+
+    def test_shared_parser_results_identical_to_fresh_parser(self):
+        shared = parser.get_parser("en-us")
+
+        for string, fmt in self.CASES:
+            expected = parser.DateTimeParser("en-us", cache_size=0).parse(string, fmt)
+            assert shared.parse(string, fmt) == expected
+
+        for string in self.ISO_STRINGS:
+            expected = parser.DateTimeParser("en-us", cache_size=0).parse_iso(string)
+            assert shared.parse_iso(string) == expected
+
+    def test_concurrent_shared_parser_consistency(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        cases = [("en-us", string, fmt) for string, fmt in self.CASES]
+        cases += [
+            ("fr-fr", "5 mai 2013", "D MMMM YYYY"),
+            ("es-es", "5 mayo 2013", "D MMMM YYYY"),
+        ]
+
+        parser.get_parser.cache_clear()
+        expected = [parser.get_parser(loc).parse(s, f) for loc, s, f in cases]
+
+        def work(i):
+            loc, s, f = cases[i % len(cases)]
+            return parser.get_parser(loc).parse(s, f)
+
+        total = 4000
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(work, range(total)))
+
+        assert results == [expected[i % len(cases)] for i in range(total)]
+
+        # exactly one cache miss per distinct locale, everything else a hit
+        info = parser.get_parser.cache_info()
+        distinct_locales = {loc for loc, _, _ in cases}
+        assert info.misses == len(distinct_locales)
+        assert info.currsize == len(distinct_locales)
+
+    def test_repeated_parse_latency_gradient(self):
+        string, fmt = "2013-05-05 12:30:45", "YYYY-MM-DD HH:mm:ss"
+
+        def time_per_op(fn, iterations):
+            fn()  # warmup
+            start = time.perf_counter()
+            for _ in range(iterations):
+                fn()
+            return (time.perf_counter() - start) / iterations
+
+        # both levels rebuilt: fresh parser instance and fresh regexes per parse
+        cold = time_per_op(
+            lambda: DateTimeParser("en-us", cache_size=0).parse(string, fmt), 200
+        )
+
+        # level 1 reused only: shared instance, regexes regenerated per parse
+        instance_only_parser = DateTimeParser("en-us", cache_size=0)
+        instance_only = time_per_op(
+            lambda: instance_only_parser.parse(string, fmt), 2000
+        )
+
+        # both levels cached: shared instance plus cached regexes
+        shared_parser = parser.get_parser("en-us")
+        fully_cached = time_per_op(lambda: shared_parser.parse(string, fmt), 2000)
+
+        assert instance_only < cold
+        assert fully_cached < instance_only
+        # cache hits must be significantly faster than a full rebuild
+        # (note: the re module's own internal cache already hides most of the
+        # regex compilation cost here, so the real-world gap is even larger)
+        assert fully_cached * 2 < cold

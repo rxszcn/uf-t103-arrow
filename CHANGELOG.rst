@@ -1,6 +1,11 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+- [CHANGED] Parsing performance: ``DateTimeParser`` instances are now cached per locale and reused by ``ArrowFactory.get()`` via the new ``arrow.parser.get_parser()`` (bounded LRU, 64 locales), and the parser's regular expression LRU cache is now enabled by default (``cache_size`` defaults to 256; pass ``cache_size=0`` to restore the previous no-cache behavior).
+
 1.4.0 (2025-10-18)
 ------------------
 
